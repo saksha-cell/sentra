@@ -1,5 +1,7 @@
 """Brain: reads ESP32 serial lines, counts real devices, serves JSON for the dashboard."""
-import serial, time, threading, queue, json
+import serial, time, threading, queue, json, os
+from collections import deque
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ---------- Settings (tune these) ----------
@@ -7,9 +9,9 @@ PORT = "COM9"
 BAUD = 115200               # must match the ESP32 code
 RSSI_TOLERANCE = 10         # dBm, for cross-burst matching
 MATCH_WINDOW = 60           # sec, how long a device can be "re-matched"
-EXPIRY_SECONDS = 90         # sec, device removed if not seen this long
+EXPIRY_SECONDS = 180        # sec, device removed if not seen this long
 MIN_PACKETS = 2             # packets needed before a device counts
-ALERT_THRESHOLD = 10        # count at which alert turns on
+ALERT_THRESHOLD = 4       # count at which alert turns on
 HTTP_PORT = 8000
 LOG_FILE = "raw_log.csv"    # every raw line saved here for offline replay
 
@@ -20,6 +22,7 @@ devices = {}        # dev_id -> {fps, rssi, last_seen, hits, random}
 mac_to_dev = {}     # mac -> dev_id
 raw_macs = {}       # mac -> last_seen (the "dumb" count, for comparison)
 next_id = 0
+history = deque(maxlen=1000)  
 
 
 def is_random(mac):
@@ -135,11 +138,53 @@ def printer():
                   f"{'  *** ALERT ***' if s['alert'] else ''}")
             last = s
 
+# ---------- Thread 5: log every change in count, with real time ----------
+def recorder():
+    last_count = None
+    path = "history.csv"
+    need_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a") as f:
+        if need_header:
+            f.write("time,count,raw_count\n")
+        while True:
+            time.sleep(1)
+            s = snapshot()
+            if s["count"] != last_count:
+                now = datetime.now()
+                row = {
+                    "t": int(now.timestamp()),
+                    "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "count": s["count"],
+                    "raw_count": s["raw_count"],
+                }
+                history.append(row)
+                f.write(f'{row["time"]},{row["count"]},{row["raw_count"]}\n')
+                f.flush()
+                last_count = s["count"]            
+
 
 # ---------- Web endpoint for the dashboard ----------
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps(snapshot()).encode()
+        if self.path.startswith("/rawlog"):
+            try:
+                with open(LOG_FILE, "rb") as f:
+                    data = f.read()
+            except FileNotFoundError:
+                data = b""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            if self.path == "/rawlog.csv":
+                self.send_header("Content-Disposition", "attachment; filename=raw_log.csv")
+            self.end_headers()
+            self.wfile.write(data)
+            return   
+        if self.path.startswith("/history"):
+            data = list(history)
+        else:
+            data = snapshot()
+        body = json.dumps(data).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -149,9 +194,8 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-
 if __name__ == "__main__":
-    for fn in (reader, processor, expiry, printer):
+    for fn in (reader, processor, expiry, printer, recorder):
         threading.Thread(target=fn, daemon=True).start()
     print(f"Running. Live data at http://localhost:{HTTP_PORT}")
     HTTPServer(("", HTTP_PORT), Handler).serve_forever()
